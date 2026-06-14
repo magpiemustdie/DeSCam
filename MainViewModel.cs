@@ -162,9 +162,12 @@ public class MainViewModel : INotifyPropertyChanged
         // Debug EBOOT: resolve ptr-chain addresses in background
         if (!directMode && _mem.FollowNode != 0)
         {
+            // Snapshot the rows list on the UI thread — Params (ObservableCollection)
+            // must not be enumerated from a background thread.
+            var rowSnapshot = Params.ToList();
             Task.Run(() =>
             {
-                foreach (var row in Params.ToList())
+                foreach (var row in rowSnapshot)
                 {
                     var ptr = _mem.GetParamPtr(row.Def.NodeOffset);
                     if (ptr.HasValue)
@@ -309,7 +312,10 @@ public class MainViewModel : INotifyPropertyChanged
                 }
 
                 // Re-apply locked values to new node
-                var locked = Params.Where(p => p.IsLocked && !string.IsNullOrWhiteSpace(p.Input)).ToList();
+                var locked = Params
+                    .Where(p => p.IsLocked && !string.IsNullOrWhiteSpace(p.Input))
+                    .Select(p => (p.Def, Input: p.Input))   // snapshot on UI thread
+                    .ToList();
                 if (locked.Count > 0)
                 {
                     // Ensure lock timer is running regardless of how we got here
@@ -317,12 +323,12 @@ public class MainViewModel : INotifyPropertyChanged
                     AddLog($"Re-applying {locked.Count} locked value(s)…");
                     await Task.Run(() =>
                     {
-                        foreach (var row in locked)
-                            if (double.TryParse(row.Input,
+                        foreach (var (def, input) in locked)
+                            if (double.TryParse(input,
                                 System.Globalization.NumberStyles.Float,
                                 System.Globalization.CultureInfo.InvariantCulture,
                                 out double val))
-                                _mem.WriteParam(row.Def.NodeOffset, row.Def.Unit, val, row.Def.FieldOffset, row.Def.DirectOffset);
+                                _mem.WriteParam(def.NodeOffset, def.Unit, val, def.FieldOffset, def.DirectOffset);
                     });
                 }
                 await RefreshAsync();
@@ -555,12 +561,12 @@ public class MainViewModel : INotifyPropertyChanged
                     float f = BitConverter.ToSingle(new byte[]{d[i+3],d[i+2],d[i+1],d[i]});
                     if (float.IsNaN(f) || f < minRad || f > maxRad) continue;
                     uint addr = (uint)(va + i);
-                    // Context: nearby u32 values
+                    // Context: nearby floats (big-endian: most-significant byte first)
                     string ctx = "";
                     if (i >= 4 && i + 8 <= d.Length)
                     {
-                        float prev = BitConverter.ToSingle(new byte[]{d[i-1],d[i-2],d[i-3],d[i-4]});
-                        float next = BitConverter.ToSingle(new byte[]{d[i+7],d[i+6],d[i+5],d[i+4]});
+                        float prev = BitConverter.ToSingle(new byte[]{d[i-4],d[i-3],d[i-2],d[i-1]});
+                        float next = BitConverter.ToSingle(new byte[]{d[i+4],d[i+5],d[i+6],d[i+7]});
                         ctx = $"prev={prev:G4} next={next:G4}";
                     }
                     results.Add((addr, f, ctx));
@@ -617,17 +623,30 @@ public class MainViewModel : INotifyPropertyChanged
                     row.LiveDeg = val.HasValue ? $"{val.Value * 57.296f:F1}°" : "err";
             }
         });
-        // Apply locks
-        var locked = rows.Where(r => r.IsLocked && !string.IsNullOrWhiteSpace(r.SetValue)).ToList();
-        if (locked.Count > 0)
+
+        // Apply locks — only write if connection is alive.
+        // Snapshot (addr, setValue) on the UI thread before Task.Run so we never
+        // read INotifyPropertyChanged properties from a background thread.
+        // Note: FovyScan addresses are raw heap pointers from a previous scan; after
+        // a level transition they may point to freed memory. We don't have a per-row
+        // vtable to validate, so we rely on NtWriteVirtualMemory returning an error
+        // for unmapped pages (WriteF32 returns false) rather than crashing RPCS3.
+        var lockedSnap = rows
+            .Where(r => r.IsLocked && !string.IsNullOrWhiteSpace(r.SetValue))
+            .Select(r => (r.Addr, r.SetValue))
+            .ToList();
+        if (lockedSnap.Count > 0 && _mem.IsOpen)
+        {
             await Task.Run(() =>
             {
-                foreach (var row in locked)
-                    if (double.TryParse(row.SetValue,
+                foreach (var (addr, setValue) in lockedSnap)
+                    if (double.TryParse(setValue,
                         System.Globalization.NumberStyles.Float,
                         System.Globalization.CultureInfo.InvariantCulture, out double deg))
-                        _mem.WriteF32(row.Addr, (float)(deg / 57.296));
+                        try { _mem.WriteF32(addr, (float)(deg / 57.296)); }
+                        catch { /* ignore write errors — stale address after teleport */ }
             });
+        }
     }
 
     public async Task WriteFovYRangeAsync(double deg, int fromRow, int toRow)
@@ -636,17 +655,22 @@ public class MainViewModel : INotifyPropertyChanged
         float rad = (float)(deg / 57.296);
         var targets = FovyScanResults.Skip(fromRow).Take(toRow - fromRow).ToList();
         if (targets.Count == 0) { AddLog($"No rows in range {fromRow}..{toRow}"); return; }
+        string setStr = $"{deg:F1}";
         int ok = 0, fail = 0;
         await Task.Run(() =>
         {
             foreach (var row in targets)
-                if (_mem.WriteF32(row.Addr, rad)) { ok++; row.SetValue = $"{deg:F1}"; }
+                if (_mem.WriteF32(row.Addr, rad)) ok++;
                 else fail++;
         });
+        // Update UI properties on the UI thread
         _ui.Invoke(() =>
         {
             foreach (var row in targets)
-                row.LiveDeg = $"{deg:F1}°";
+            {
+                row.SetValue = setStr;
+                row.LiveDeg  = $"{deg:F1}°";
+            }
         });
         AddLog($"Write {deg:F1}° to rows {fromRow}..{toRow} ({targets.Count} rows): OK={ok} FAIL={fail}");
     }
@@ -656,17 +680,22 @@ public class MainViewModel : INotifyPropertyChanged
         if (!IsConnected || FovyScanResults.Count == 0) { AddLog("No results to write"); return; }
         float rad = (float)(deg / 57.296);
         var targets = FovyScanResults.Take(count).ToList();
+        string setStr = $"{deg:F1}";
         int ok = 0, fail = 0;
         await Task.Run(() =>
         {
             foreach (var row in targets)
-                if (_mem.WriteF32(row.Addr, rad)) { ok++; row.SetValue = $"{deg:F1}"; }
+                if (_mem.WriteF32(row.Addr, rad)) ok++;
                 else fail++;
         });
+        // Update UI properties on the UI thread
         _ui.Invoke(() =>
         {
             foreach (var row in targets)
-                row.LiveDeg = $"{deg:F1}°";
+            {
+                row.SetValue = setStr;
+                row.LiveDeg  = $"{deg:F1}°";
+            }
         });
         AddLog($"Write {deg:F0}° to first {count} ({targets.Count} rows): OK={ok} FAIL={fail}");
     }
@@ -829,19 +858,39 @@ public class MainViewModel : INotifyPropertyChanged
     async Task WriteLocked()
     {
         if (!IsConnected || !NodeFound) return;
-        var locked = Params.Where(p => p.IsLocked && !string.IsNullOrWhiteSpace(p.Input))
-                           .ToList();
+
+        // Snapshot input values on the UI thread before entering Task.Run
+        var locked = Params
+            .Where(p => p.IsLocked && !string.IsNullOrWhiteSpace(p.Input))
+            .Select(p => (p.Def, Input: p.Input))
+            .ToList();
         if (locked.Count == 0) return;
-        // No extra node validation here — RefreshAsync handles that every 500ms
+
+        bool nodeStillValid = await Task.Run(() => _mem.IsFollowNodeValid());
+        if (!nodeStillValid)
+        {
+            // Node was invalidated (teleport / level transition) — don't write stale
+            // memory. Mark node as lost so RefreshAsync will trigger a re-search.
+            AddLog("WriteLocked: node invalidated — aborting write, re-searching…");
+            NodeFound = false;
+            NodeText  = "ChrFollowCam node: re-searching…";
+            if (!_searching) _ = FindNodeAsync(_debugEboot);
+            return;
+        }
+
         await Task.Run(() =>
         {
-            foreach (var row in locked)
+            foreach (var (def, input) in locked)
             {
-                if (!double.TryParse(row.Input,
+                if (!double.TryParse(input,
                     System.Globalization.NumberStyles.Float,
                     System.Globalization.CultureInfo.InvariantCulture,
                     out double val)) continue;
-                _mem.WriteParam(row.Def.NodeOffset, row.Def.Unit, val, row.Def.FieldOffset, row.Def.DirectOffset);
+                try
+                {
+                    _mem.WriteParam(def.NodeOffset, def.Unit, val, def.FieldOffset, def.DirectOffset);
+                }
+                catch { /* NtWriteVirtualMemory failure — node was freed mid-write */ }
             }
         });
     }
