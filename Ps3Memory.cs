@@ -24,6 +24,13 @@ public sealed class Ps3Memory : IDisposable
     [DllImport("kernel32.dll")] static extern nint CreateToolhelp32Snapshot(uint flags, uint pid);
     [DllImport("kernel32.dll")] static extern bool Process32First(nint snap, ref PE32 e);
     [DllImport("kernel32.dll")] static extern bool Process32Next(nint snap,  ref PE32 e);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern nint FindWindowW(string? lpClassName, string lpWindowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, nint lParam);
+    delegate bool EnumWindowsProc(nint hWnd, nint lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetWindowTextW(nint hWnd, System.Text.StringBuilder lpString, int nMaxCount);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     struct PE32
@@ -61,18 +68,27 @@ public sealed class Ps3Memory : IDisposable
     // debug_menu chain (BLUS30443v100): *(r2-0x7F98) chain
     const uint TOC_STEP1 = 0x019AD0A8;
 
-    // ── State ─────────────────────────────────────────────────────────────────
+    public const float FOVY_MIN = 0.1f;  // ~5.7°
+    public const float FOVY_MAX = 3.2f;  // ~183°
+    public static bool FovRangeCheckEnabled { get; set; } = true;
+
+    // ── State (volatile for cross-thread visibility) ──────────────────────────
     nint _handle;
     public int  Pid        { get; private set; }
     public bool Verified   { get; private set; }
-    public uint FollowNode { get; private set; }
-    public bool IsOpen     => _handle != nint.Zero;
+
+    volatile uint _followNode;
+    /// <summary>PS3 virtual address of the ChrFollowCam object.</summary>
+    public uint FollowNode { get => _followNode; private set => _followNode = value; }
+
+    public bool IsOpen => _handle != nint.Zero;
 
     /// <summary>
     /// True  = normal EBOOT: params are direct floats in FollowNode body (DirectOffset).
     /// False = debug EBOOT:  params are accessed via ptr-chain (NodeOffset+PARAM_VALPTR_OFF).
     /// </summary>
-    public bool DirectMode { get; private set; }
+    volatile bool _directMode;
+    public bool DirectMode { get => _directMode; private set => _directMode = value; }
 
     // Per-thread 4-byte buffer for scalar reads — avoids GC allocs AND data races
     // between concurrent Task.Run calls that both call ReadRaw4/ReadU32/ReadF32.
@@ -81,6 +97,23 @@ public sealed class Ps3Memory : IDisposable
     static byte[] Buf4 => _buf4Thread ??= new byte[4];
 
     // ── Process helpers ───────────────────────────────────────────────────────
+    /// <summary>Checks if the Demon's Souls game window (RPCS3 child window) exists.
+    /// Uses EnumWindows to find any top-level window whose title contains "Demon's"
+    /// (covers "Demon's Souls™", "Demon's Souls [BLUS30443]", etc.).</summary>
+    public static bool IsGameWindowOpen()
+    {
+        bool found = false;
+        EnumWindows((hWnd, _) =>
+        {
+            var sb = new System.Text.StringBuilder(256);
+            GetWindowTextW(hWnd, sb, sb.Capacity);
+            if (sb.ToString().Contains("Demon's"))
+            { found = true; return false; } // stop enumeration
+            return true;
+        }, nint.Zero);
+        return found;
+    }
+
     public static int FindPid(string name)
     {
         nint snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -245,7 +278,7 @@ public sealed class Ps3Memory : IDisposable
         }
         progress?.Report($"root_node=0x{root.Value:X8}");
 
-        var chrcam = FindChrCamInTree(root.Value, progress, 0, new HashSet<uint>());
+        var chrcam = FindChrCamInTree(root.Value, progress);
         if (!chrcam.HasValue) { progress?.Report("ChrCam not found in tree"); return null; }
 
         var follow = ReadU32(chrcam.Value + 0x1C);
@@ -260,30 +293,82 @@ public sealed class Ps3Memory : IDisposable
         return follow;
     }
 
-    uint? FindChrCamInTree(uint va, IProgress<string>? prog, int depth, HashSet<uint> visited)
+    /// <summary>
+    /// HgItem tree walk using correct PS3 SDK node layout:
+    ///   +0x00 vtable  +0x04 flags  +0x08 parent
+    ///   +0x1C first child  +0x20 next sibling
+    ///   +0x2C label (UTF-16BE)  +0x30 value ptr
+    /// Children can be a flat-array container (if container's own vtable is NOT BSS).
+    /// </summary>
+    static uint BE32(byte[] d, int off) => (uint)(d[off]<<24 | d[off+1]<<16 | d[off+2]<<8 | d[off+3]);
+
+    uint? FindChrCamInTree(uint rootVa, IProgress<string>? prog, int maxDepth = 12)
     {
-        if (depth > 8 || !visited.Add(va) || !IsHeapPtr(va))
-            return null;
+        if (!IsHeapPtr(rootVa)) return null;
+        int totalVisited = 0;
+        var visited = new HashSet<uint>();
+        var queue   = new Queue<(uint addr, int depth)>();
+        queue.Enqueue((rootVa, 0));
 
-        // FIX: need at least 0x20 bytes to safely read the child pointer at +0x1C
-        var data = ReadBytes(va, 0x20);
-        if (data == null || data.Length < 0x20) return null;
-
-        // Check +0x10 for CHRCAM_NEEDLE (big-endian)
-        var tmp = data[0x10..0x14];
-        if (BitConverter.IsLittleEndian) Array.Reverse(tmp);
-        if (BitConverter.ToUInt32(tmp, 0) == CHRCAM_NEEDLE) return va;
-
-        // Walk children at offsets +0x04, +0x08, +0x0C, +0x1C
-        foreach (int co in new[] { 0x1C, 0x04, 0x08, 0x0C })
+        while (queue.Count > 0)
         {
-            var cb = data[co..(co + 4)];
-            if (BitConverter.IsLittleEndian) Array.Reverse(cb);
-            uint child = BitConverter.ToUInt32(cb, 0);
-            if (!IsHeapPtr(child)) continue;
-            var found = FindChrCamInTree(child, prog, depth + 1, visited);
-            if (found.HasValue) return found;
+            var (va, depth) = queue.Dequeue();
+            if (depth > maxDepth || !visited.Add(va)) continue;
+            if (!IsHeapPtr(va)) continue;
+            totalVisited++;
+
+            var data = ReadBytes(va, 0x40);
+            if (data == null || data.Length < 0x24) continue;
+
+            // Check for CHRCAM_NEEDLE at +0x10 (big-endian)
+            if (BE32(data, 0x10) == CHRCAM_NEEDLE)
+            {
+                prog?.Report($"found ChrCam @ 0x{va:X8} (visited {totalVisited} nodes, depth {depth})");
+                return va;
+            }
+
+            // First child / container pointer at +0x1C
+            uint childOrContainer = BE32(data, 0x1C);
+            if (childOrContainer == 0 || !IsHeapPtr(childOrContainer)) continue;
+
+            // Detect flat-array container: if its "vtable" (first uint32) is NOT in BSS
+            var containerVt = ReadU32(childOrContainer);
+            bool isFlatArray = containerVt.HasValue && !IsBssPtr(containerVt.Value);
+
+            if (isFlatArray)
+            {
+                // Flat array of consecutive uint32 child pointers starting at container+4
+                var arr = ReadBytes(childOrContainer, 0x800);
+                if (arr == null) continue;
+                for (int off = 4; off + 4 <= arr.Length; off += 4)
+                {
+                    uint c = BE32(arr, off);
+                    if (c == 0 || !IsHeapPtr(c)) break;
+                    if (!visited.Contains(c))
+                        queue.Enqueue((c, depth + 1));
+                }
+            }
+            else
+            {
+                // HgItem linked list: first child at +0x1C, siblings at +0x20
+                // Enqueue in reverse order so siblings appear in natural order via BFS
+                var sibAddrs = new List<uint>();
+                uint sib = childOrContainer;
+                while (sib != 0 && IsHeapPtr(sib) && sibAddrs.Count < 512)
+                {
+                    sibAddrs.Add(sib);
+                    var sibData = ReadBytes(sib, 0x24);
+                    if (sibData == null || sibData.Length < 0x24) break;
+                    sib = BE32(sibData, 0x20);
+                }
+                // Push in forward order so BFS processes them naturally
+                for (int i = 0; i < sibAddrs.Count; i++)
+                    if (!visited.Contains(sibAddrs[i]))
+                        queue.Enqueue((sibAddrs[i], depth + 1));
+            }
         }
+
+        prog?.Report($"tree walk done — visited {totalVisited} nodes, ChrCam not found");
         return null;
     }
 
@@ -325,14 +410,36 @@ public sealed class Ps3Memory : IDisposable
                     if (vt.HasValue && IsBssPtr(vt.Value))
                     {
                         var follow = ReadU32(chrcam + 0x1C);
-                        // FIX: use wide heap range — follow can be anywhere in 0x30M..0x42M
-                        if (follow.HasValue && IsHeapPtr(follow.Value))
+                        if (!follow.HasValue || !IsHeapPtr(follow.Value)) { off = idx + 4; continue; }
+
+                        // Validate follow node: its vtable must be in BSS range.
+                        var fvt = ReadU32(follow.Value);
+                        if (!fvt.HasValue || !IsBssPtr(fvt.Value)) { off = idx + 4; continue; }
+
+                        // Validate FovY is plausible to reject stale nodes during
+                        // level transitions.  The FovY location depends on EBOOT type:
+                        //   normal EBOOT: direct float at follow+0x50
+                        //   debug  EBOOT: val ptr at follow+0x0050+0x30 → heap float
+                        float? fovy = null;
+                        var slotVt = ReadU32(follow.Value + 0x50);
+                        if (slotVt.HasValue && IsBssPtr(slotVt.Value))
                         {
-                            progress?.Report($"ChrCam=0x{chrcam:X8}  ChrFollowCam=0x{follow.Value:X8}");
-                            DirectMode = false;
-                            FollowNode = follow.Value;
-                            return follow;
+                            // Looks like a debug_menu tree entry — read via ptr-chain
+                            var vp = ReadU32(follow.Value + 0x0050 + PARAM_VALPTR_OFF);
+                            if (vp.HasValue && IsHeapPtr(vp.Value)) fovy = ReadF32(vp.Value);
                         }
+                        else
+                        {
+                            // Direct float at follow+0x50 (normal EBOOT)
+                            fovy = ReadF32(follow.Value + 0x50);
+                        }
+                        if (!fovy.HasValue || (FovRangeCheckEnabled && (fovy.Value < FOVY_MIN || fovy.Value > FOVY_MAX)))
+                        { off = idx + 4; continue; }
+
+                        progress?.Report($"ChrCam=0x{chrcam:X8}  ChrFollowCam=0x{follow.Value:X8}  FovY={fovy.Value*RAD2DEG:F1}°");
+                        DirectMode = false;
+                        FollowNode = follow.Value;
+                        return follow;
                     }
                 }
                 off = idx + 4;
@@ -395,11 +502,21 @@ public sealed class Ps3Memory : IDisposable
                 int fo = i + 0x1C;
                 uint follow = (uint)(d[fo]<<24|d[fo+1]<<16|d[fo+2]<<8|d[fo+3]);
                 if (!IsHeapPtr(follow)) continue;
+                uint cand = (uint)(va + i);
+
+                // TOCTOU guard: re-read candidate from live memory to detect
+                // free+realloc between chunk scan and the validation reads below.
+                var reRead = ReadBytes(cand, 0x20);
+                if (reRead is null || reRead.Length < 0x20) continue;
+                uint vt2 = (uint)(reRead[0]<<24|reRead[1]<<16|reRead[2]<<8|reRead[3]);
+                if (vt2 != CHRCAM_VT) continue;
+                uint follow2 = (uint)(reRead[0x1C]<<24|reRead[0x1D]<<16|reRead[0x1E]<<8|reRead[0x1F]);
+                if (follow2 != follow) continue;
+
                 var followVtCheck = ReadU32(follow);
                 if (!followVtCheck.HasValue || !IsBssPtr(followVtCheck.Value)) continue;
                 var fovy = ReadF32(follow + 0x1B0);
-                if (!fovy.HasValue || fovy.Value < 0.1f || fovy.Value > 3.1f) continue;
-                uint cand = (uint)(va + i);
+                if (!fovy.HasValue || (FovRangeCheckEnabled && (fovy.Value < FOVY_MIN || fovy.Value > FOVY_MAX))) continue;
                 progress?.Report($"ChrCam=0x{cand:X8}  Follow=0x{follow:X8}  FovY@+0x1B0={fovy.Value*RAD2DEG:F1}°");
                 DirectMode = true;
                 FollowNode = follow;
@@ -431,6 +548,17 @@ public sealed class Ps3Memory : IDisposable
         return null;
     }
 
+    /// <summary>Checks whether the Demon's Souls game is still running.
+    /// Fast path: look for the game window by title.  Fallback: verify the
+    /// "ChrCam" marker string in PS3 memory (covers headless/no-window modes).</summary>
+    public bool IsProcessAlive()
+    {
+        if (!IsOpen) return false;
+        if (IsGameWindowOpen()) return true;
+        var s = ReadString(PS3_CHRCAM_STR, 7);
+        return s?.StartsWith("ChrCam") == true;
+    }
+
     /// <summary>
     /// Fast check: returns true only when FollowNode is set and its vtable still
     /// falls in the known BSS range.  Call this before any write burst to avoid
@@ -460,7 +588,7 @@ public sealed class Ps3Memory : IDisposable
         {
             float f = BitConverter.ToSingle(new byte[]{data[i+3],data[i+2],data[i+1],data[i]});
             if (float.IsNaN(f) || float.IsInfinity(f) || f == 0f) continue;
-            if (Math.Abs(f) < 1e-6f || Math.Abs(f) > 1e6f) continue;
+            if (Math.Abs(f) > 1e6f) continue;
             lines.Add($"  +0x{i:X3} = {f:G6}");
         }
         return lines;
@@ -630,26 +758,65 @@ public sealed class Ps3Memory : IDisposable
 
     public double? ReadParam(uint nodeOffset, string unit, int fieldOffset = 0, uint directOffset = 0)
     {
-        float? raw;
-        if (DirectMode && directOffset != 0)
+        if (unit == "bool")
         {
-            raw = ReadF32(FollowNode + directOffset + (uint)fieldOffset);
+            uint? raw;
+            if (DirectMode)
+            {
+                if (directOffset == 0) return null;
+                raw = ReadU32(FollowNode + directOffset + (uint)fieldOffset);
+            }
+            else
+            {
+                var ptr = GetParamPtr(nodeOffset);
+                if (ptr is null) return null;
+                raw = ReadU32((uint)(ptr.Value + fieldOffset));
+            }
+            return raw;
         }
         else
         {
-            var ptr = GetParamPtr(nodeOffset);
-            if (ptr is null) return null;
-            raw = ReadF32((uint)(ptr.Value + fieldOffset));
+            float? raw;
+            if (DirectMode)
+            {
+                if (directOffset == 0) return null;
+                raw = ReadF32(FollowNode + directOffset + (uint)fieldOffset);
+            }
+            else
+            {
+                var ptr = GetParamPtr(nodeOffset);
+                if (ptr is null) return null;
+                raw = ReadF32((uint)(ptr.Value + fieldOffset));
+            }
+            if (raw is null) return null;
+            return unit == "rad" ? raw.Value * RAD2DEG : raw.Value;
         }
-        if (raw is null) return null;
-        return unit == "rad" ? raw.Value * RAD2DEG : raw.Value;
     }
 
     public bool WriteParam(uint nodeOffset, string unit, double display, int fieldOffset = 0, uint directOffset = 0)
     {
+        // Guard: NO=0 params (runtime / tree-only) are not writable via ptr-chain
+        if (!DirectMode && nodeOffset == 0) return false;
+        if (unit == "bool")
+        {
+            uint val = (uint)(int)display;
+            byte[] b = BitConverter.GetBytes(val);
+            if (BitConverter.IsLittleEndian) Array.Reverse(b);
+            if (DirectMode)
+            {
+                if (directOffset == 0) return false;
+                return WriteBytes(FollowNode + directOffset + (uint)fieldOffset, b);
+            }
+            var p = GetParamPtr(nodeOffset);
+            if (p is null) return false;
+            return WriteBytes((uint)(p.Value + fieldOffset), b);
+        }
         float store = unit == "rad" ? (float)(display * DEG2RAD) : (float)display;
-        if (DirectMode && directOffset != 0)
+        if (DirectMode)
+        {
+            if (directOffset == 0) return false;
             return WriteF32(FollowNode + directOffset + (uint)fieldOffset, store);
+        }
         var ptr = GetParamPtr(nodeOffset);
         if (ptr is null) return false;
         return WriteF32((uint)(ptr.Value + fieldOffset), store);
@@ -668,7 +835,15 @@ public sealed class Ps3Memory : IDisposable
             return result;
         }
 
-        const int blockSize = 0x800;
+        
+        // Block must cover the furthest NodeOffset + PARAM_VALPTR_OFF + 4.
+        uint maxNo = 0;
+        foreach (var d in defs)
+        {
+            uint need = d.NodeOffset > d.DirectOffset ? d.NodeOffset : d.DirectOffset;
+            if (need > maxNo) maxNo = need;
+        }
+        int blockSize = (int)(maxNo + PARAM_VALPTR_OFF + 4);
         var nodeBlock = ReadBytes(FollowNode, blockSize);
         if (nodeBlock == null)
         {
@@ -676,6 +851,15 @@ public sealed class Ps3Memory : IDisposable
             return result;
         }
 
+        // Verify the last 4 bytes of the block are readable.  If the block spans
+        // an unmapped page, ReadBytes zero-fills the gap and we'd silently return
+        // false-positive 0 for params on that page instead of "err".
+        if (ReadU32(FollowNode + (uint)blockSize - 4) is null)
+        {
+            foreach (var d in defs) result[d.Name] = null;
+            return result;
+        }
+        
         if (DirectMode)
         {
             // Direct mode: float at FollowNode + DirectOffset + FieldOffset
@@ -685,21 +869,32 @@ public sealed class Ps3Memory : IDisposable
                 int off = (int)def.DirectOffset + def.FieldOffset;
                 // Guard: offset must be non-negative and fit in the block
                 if (off < 0 || off + 4 > nodeBlock.Length) { result[def.Name] = null; continue; }
-                Span<byte> fb = nodeBlock.AsSpan(off, 4);
-                float raw = BitConverter.IsLittleEndian
-                    ? BitConverter.ToSingle(new byte[] { fb[3], fb[2], fb[1], fb[0] })
-                    : BitConverter.ToSingle(fb);
-                if (float.IsNaN(raw) || float.IsInfinity(raw)) { result[def.Name] = null; continue; }
-                result[def.Name] = def.Unit == "rad" ? raw * RAD2DEG : raw;
+                if (def.Unit == "bool")
+                {
+                    int raw = nodeBlock[off + 3] | (nodeBlock[off + 2] << 8) | (nodeBlock[off + 1] << 16) | (nodeBlock[off] << 24);
+                    result[def.Name] = raw;
+                }
+                else
+                {
+                    Span<byte> fb = nodeBlock.AsSpan(off, 4);
+                    float raw = BitConverter.IsLittleEndian
+                        ? BitConverter.ToSingle(new byte[] { fb[3], fb[2], fb[1], fb[0] })
+                        : BitConverter.ToSingle(fb);
+                    if (float.IsNaN(raw) || float.IsInfinity(raw)) { result[def.Name] = null; continue; }
+                    result[def.Name] = def.Unit == "rad" ? raw * RAD2DEG : raw;
+                }
             }
             return result;
         }
+        
 
-        // Ptr-chain mode (debug EBOOT)
+        // Ptr-chain mode (debug EBOOT) — NodeOffset is authoritative, no fallback
         var pageCache = new Dictionary<uint, byte[]?>(8);
 
         foreach (var def in defs)
         {
+            if (def.NodeOffset == 0) { result[def.Name] = null; continue; }
+
             int ptrOff = (int)(def.NodeOffset + PARAM_VALPTR_OFF);
             if (ptrOff < 0 || ptrOff + 4 > nodeBlock.Length) { result[def.Name] = null; continue; }
 
@@ -710,7 +905,6 @@ public sealed class Ps3Memory : IDisposable
 
             if (ptr < 0x10000000 || ptr > 0x50000000u) { result[def.Name] = null; continue; }
 
-            // Read a 64-byte page aligned to ptr
             uint pageBase = ptr & ~63u;
             if (!pageCache.TryGetValue(pageBase, out var page))
             {
@@ -719,19 +913,378 @@ public sealed class Ps3Memory : IDisposable
             }
             if (page == null) { result[def.Name] = null; continue; }
 
-            int lo = (int)(ptr - pageBase) + def.FieldOffset;
-            // Guard: lo must be non-negative and fit in the 64-byte page
-            if (lo < 0 || lo + 4 > page.Length) { result[def.Name] = null; continue; }
+            if (def.Unit == "bool")
+            {
+                int lo = (int)(ptr - pageBase) + def.FieldOffset;
+                if (lo < 0 || lo + 4 > page.Length) { result[def.Name] = null; continue; }
+                int raw = page[lo + 3] | (page[lo + 2] << 8) | (page[lo + 1] << 16) | (page[lo] << 24);
+                result[def.Name] = raw;
+            }
+            else
+            {
+                int lo = (int)(ptr - pageBase) + def.FieldOffset;
+                if (lo < 0 || lo + 4 > page.Length) { result[def.Name] = null; continue; }
 
-            Span<byte> fb = page.AsSpan(lo, 4);
-            float raw = BitConverter.IsLittleEndian
+                Span<byte> fb = page.AsSpan(lo, 4);
+                float raw = BitConverter.IsLittleEndian
+                    ? BitConverter.ToSingle(new byte[] { fb[3], fb[2], fb[1], fb[0] })
+                    : BitConverter.ToSingle(fb);
+
+                if (float.IsNaN(raw) || float.IsInfinity(raw)) { result[def.Name] = null; continue; }
+                result[def.Name] = def.Unit == "rad" ? raw * RAD2DEG : raw;
+            }
+        }
+        return result;
+    }
+
+    // ── Deep tree analysis ───────────────────────────────────────────────────
+    /// <summary>
+    /// Exhaustive BFS of the debug_menu tree from root, trying ALL 4-byte aligned
+    /// offsets as child pointers.  Dumps every reachable node so the user can
+    /// figure out the correct tree offsets for their EBOOT version.
+    /// </summary>
+    public List<string> DeepTreeAnalysis()
+    {
+        var lines = new List<string>();
+        if (!IsOpen) { lines.Add("Not open"); return lines; }
+
+        lines.Add("=== DEEP TREE ANALYSIS ===");
+
+        // 1. Chain walk
+        var step1 = ReadU32(TOC_STEP1);
+        lines.Add($"step1 @ 0x{TOC_STEP1:X8} = 0x{step1.GetValueOrDefault():X8}");
+        if (!step1.HasValue || !IsBssPtr(step1.Value)) { lines.Add("→ chain broken at step1"); goto scanMode; }
+
+        uint s2addr = step1.Value - 0x7FFCu;
+        var step2 = ReadU32(s2addr);
+        lines.Add($"step2 @ 0x{s2addr:X8} = 0x{step2.GetValueOrDefault():X8}");
+        if (!step2.HasValue || step2.Value < 0x01000000) { lines.Add("→ chain broken at step2"); goto scanMode; }
+
+        var dmAddr = ReadU32(step2.Value);
+        lines.Add($"dm   @ 0x{step2.Value:X8} = 0x{dmAddr.GetValueOrDefault():X8}");
+        if (!dmAddr.HasValue || !IsHeapPtr(dmAddr.Value)) { lines.Add("→ chain broken at dm"); goto scanMode; }
+
+        // 2. Dump full debug_menu node (0x200 bytes)
+        var dmData = ReadBytes(dmAddr.Value, 0x200);
+        if (dmData != null)
+        {
+            lines.Add($"--- dm[0..1FF] @ 0x{dmAddr.Value:X8} ---");
+            for (int i = 0; i < dmData.Length; i += 16)
+            {
+                var sb = new System.Text.StringBuilder($"  {dmAddr.Value:X8}+{i:X3}: ");
+                for (int j = 0; j < 16; j++) sb.Append($"{dmData[i+j]:X2}");
+                sb.Append("  ");
+                for (int j = 0; j < 16; j++)
+                {
+                    byte b = dmData[i+j];
+                    sb.Append(b >= 0x20 && b < 0x7F ? (char)b : '.');
+                }
+                lines.Add(sb.ToString());
+            }
+        }
+
+        // 3. BFS from root, trying ALL 4-byte offsets as potential children
+        var root = ReadU32(dmAddr.Value + 0x04);
+        lines.Add($"root @ dm+0x04 = 0x{root.GetValueOrDefault():X8}");
+        if (!root.HasValue || !IsHeapPtr(root.Value)) { lines.Add("→ root invalid"); goto scanMode; }
+
+        lines.Add("--- BFS tree walk (trying EVERY 4-byte offset) ---");
+        var visited = new HashSet<uint>();
+        var queue   = new Queue<(uint addr, int depth, string path)>();
+        queue.Enqueue((root.Value, 0, "<root>"));
+        uint? foundNeedleAt = null;
+        string foundNeedlePath = "";
+
+        while (queue.Count > 0)
+        {
+            var (addr, depth, path) = queue.Dequeue();
+            if (!visited.Add(addr) || depth > 20) continue;
+
+            var data = ReadBytes(addr, 0x80);
+            if (data == null || data.Length < 0x20) continue;
+
+            var vt = ReadU32(addr);
+            string vtStr = vt.HasValue ? $"0x{vt.Value:X8}" : "?";
+
+            // Search for CHRCAM_NEEDLE at every 4-byte aligned offset
+            string needle = "";
+            for (int off = 0; off + 4 <= data.Length; off += 4)
+            {
+                var val = (uint)(data[off]<<24 | data[off+1]<<16 | data[off+2]<<8 | data[off+3]);
+                if (val == CHRCAM_NEEDLE)
+                {
+                    needle = $" ← CHRCAM_NEEDLE @ +{off:X3}";
+                    if (foundNeedleAt == null) { foundNeedleAt = addr; foundNeedlePath = path; }
+                }
+            }
+
+            // Dump node
+            string indent = new string(' ', depth * 2);
+            var sbNode = new System.Text.StringBuilder();
+            sbNode.Append($"  {indent}{path} depth={depth} addr=0x{addr:X8} vt={vtStr}");
+            if (needle.Length > 0) sbNode.Append(needle);
+            lines.Add(sbNode.ToString());
+
+            // Dump first 32 bytes of node as hex
+            var sbHex = new System.Text.StringBuilder($"  {indent}  hex: ");
+            for (int i = 0; i < 0x20 && i < data.Length; i++)
+                sbHex.Append($"{data[i]:X2}");
+            lines.Add(sbHex.ToString());
+
+            // Check for "ChrCam" or "ChrFollowCam" string pointers
+            for (int off = 0; off + 4 <= data.Length; off += 4)
+            {
+                uint val = (uint)(data[off]<<24 | data[off+1]<<16 | data[off+2]<<8 | data[off+3]);
+                if (val == 0) continue;
+                string? s = IsBssPtr(val) ? ReadString(val, 16) : null;
+                if (s != null && (s.Contains("ChrCam") || s.Contains("ChrFollow")))
+                    lines.Add($"  {indent}  str_ptr @ +{off:X3} → 0x{val:X8} = \"{s}\"");
+            }
+
+            // Try ALL 4-byte aligned offsets as children (skip 0 = vtable slot)
+            for (int off = 4; off + 4 <= data.Length; off += 4)
+            {
+                uint child = (uint)(data[off]<<24 | data[off+1]<<16 | data[off+2]<<8 | data[off+3]);
+                if (child == 0 || !IsHeapPtr(child) || visited.Contains(child)) continue;
+                queue.Enqueue((child, depth + 1, $"+{off:X3}"));
+            }
+
+            // Validate vtable field for self
+            for (int off = 0; off + 4 <= 0x20; off += 4)
+            {
+                uint val = (uint)(data[off]<<24 | data[off+1]<<16 | data[off+2]<<8 | data[off+3]);
+                if (val == 0 || !IsBssPtr(val)) continue;
+                string? s = ReadString(val, 4);
+                if (s != null && s.Length >= 3)
+                {
+                    var vtd = ReadBytes(val, 0x20);
+                    if (vtd != null)
+                    {
+                        bool hasHeapPtrs = false;
+                        for (int vi = 0; vi + 4 <= vtd.Length; vi += 4)
+                        {
+                            uint vp = (uint)(vtd[vi]<<24 | vtd[vi+1]<<16 | vtd[vi+2]<<8 | vtd[vi+3]);
+                            if (IsHeapPtr(vp)) { hasHeapPtrs = true; break; }
+                        }
+                            if (hasHeapPtrs)
+                                lines.Add($"  {indent}  vt+0x{off:X3}=0x{val:X8} (vtable has heap refs)");
+                    }
+                }
+            }
+        }
+
+        if (foundNeedleAt.HasValue)
+            lines.Add($"\n*** CHRCAM_NEEDLE FOUND at 0x{foundNeedleAt:X8} (path: {foundNeedlePath}) ***");
+        else
+            lines.Add("\n*** CHRCAM_NEEDLE NOT FOUND anywhere in tree ***");
+
+        lines.Add("--- END BFS ---");
+
+        scanMode:
+        // 4. Compare: dump the FollowNode found via ptr-chain scan for reference
+        lines.Add("\n--- Reference: ptr-chain scan FollowNode ---");
+        DoPtrChainScan(lines);
+
+        lines.Add("=== END DEEP TREE ANALYSIS ===");
+        return lines;
+    }
+
+    /// <summary>
+    /// Scans every possible NO (0x050 step 0x50) and reports whether the
+    /// debug_menu ptr-chain entry at NO+0x30 holds a valid value pointer.
+    /// This reveals which param slots actually exist in the ChrFollowCam struct.
+    /// </summary>
+    public List<string> ScanSlots()
+    {
+        var lines = new List<string>();
+        if (!IsOpen || FollowNode == 0) { lines.Add("No node"); return lines; }
+
+        lines.Add($"FollowNode = 0x{FollowNode:X8}  DirectMode = {DirectMode}");
+        lines.Add($"NO range: 0x050 to 0x2000 (+0x30 = value ptr)\n");
+
+        const int maxSlots = 0x2000 / 0x50; // 102 slots
+        var block = ReadBytes(FollowNode, 0x2100);
+        if (block == null) { lines.Add("Failed to read FollowNode block"); return lines; }
+
+        int valid = 0, nulls = 0, invalid = 0;
+        for (int i = 0; i < maxSlots; i++)
+        {
+            uint no  = 0x050 + (uint)i * 0x50;
+            int  off = (int)(no + PARAM_VALPTR_OFF);
+            if (off + 4 > block.Length) { lines.Add($"  NO=0x{no:X4}  [overflow]"); continue; }
+
+            uint ptr = (uint)(block[off] << 24 | block[off + 1] << 16 |
+                              block[off + 2] << 8 | block[off + 3]);
+
+            if (ptr == 0) { nulls++; continue; }
+            if (ptr < HEAP_LO || ptr >= HEAP_HI) { invalid++; continue; }
+
+            // Read float at ptr
+            var fb = ReadBytes(ptr, 4);
+            if (fb == null || fb.Length < 4) { lines.Add($"  NO=0x{no:X4}  ptr=0x{ptr:X8}  [read err]"); continue; }
+            float val = BitConverter.IsLittleEndian
                 ? BitConverter.ToSingle(new byte[] { fb[3], fb[2], fb[1], fb[0] })
                 : BitConverter.ToSingle(fb);
 
-            if (float.IsNaN(raw) || float.IsInfinity(raw)) { result[def.Name] = null; continue; }
-            result[def.Name] = def.Unit == "rad" ? raw * RAD2DEG : raw;
+            lines.Add($"  NO=0x{no:X4}  ptr=0x{ptr:X8}  val={val:G6}");
+            valid++;
         }
-        return result;
+
+        lines.Add($"\nSummary: {valid} valid, {nulls} null, {invalid} invalid pointers");
+        return lines;
+    }
+
+    /// <summary>
+    /// Scans EVERY 4-byte aligned offset in the FollowNode body for valid
+    /// value ptr-chain entries (+0x30 offset).  Finds entries at non-standard NOs.
+    /// </summary>
+    public List<string> ScanAllOffsets()
+    {
+        var lines = new List<string>();
+        if (!IsOpen || FollowNode == 0) { lines.Add("No node"); return lines; }
+
+        lines.Add($"=== SCAN ALL 4-byte OFFSETS ===");
+        lines.Add($"FollowNode = 0x{FollowNode:X8}");
+        const int scanLen = 0x2000;
+        var block = ReadBytes(FollowNode, scanLen + 0x40);
+        if (block == null) { lines.Add("Read failed"); return lines; }
+
+        int found = 0;
+        // Build a dictionary of known NO → param names for identification
+        var noToParams = new Dictionary<uint, List<string>>();
+        foreach (var p in DebugParamDef.All)
+        {
+            if (!noToParams.ContainsKey(p.NodeOffset))
+                noToParams[p.NodeOffset] = new List<string>();
+            noToParams[p.NodeOffset].Add(p.Name);
+        }
+
+        for (uint off = 0; off + 0x34 <= scanLen; off += 4)
+        {
+            int ptrOff = (int)(off + PARAM_VALPTR_OFF);
+            uint ptr = (uint)(block[ptrOff] << 24 | block[ptrOff + 1] << 16 |
+                              block[ptrOff + 2] << 8 | block[ptrOff + 3]);
+
+            if (ptr == 0) continue;
+            if (ptr < HEAP_LO || ptr >= HEAP_HI) continue;
+
+            // Read float at ptr
+            var fb = ReadBytes(ptr, 4);
+            if (fb == null || fb.Length < 4) continue;
+            float val = BitConverter.IsLittleEndian
+                ? BitConverter.ToSingle(new byte[] { fb[3], fb[2], fb[1], fb[0] })
+                : BitConverter.ToSingle(fb);
+            if (float.IsNaN(val) || float.IsInfinity(val)) continue;
+
+            string identified = "";
+            if (noToParams.TryGetValue(off, out var names))
+                identified = $"  ← {string.Join(", ", names)}";
+
+            lines.Add($"  NO=0x{off:X4}  ptr=0x{ptr:X8}  val={val:G6}{identified}");
+            found++;
+        }
+
+        lines.Add($"\nTotal entries found: {found}");
+        return lines;
+    }
+
+    /// <summary>
+    /// Dumps a large region of PS3 heap memory starting from the FOV value ptr,
+    /// showing every 4-byte value as float and uint32.
+    /// Use this to find the actual struct layout around known params.
+    /// </summary>
+    public List<string> DumpParamMemory()
+    {
+        var lines = new List<string>();
+        if (!IsOpen || FollowNode == 0) { lines.Add("No node"); return lines; }
+
+        // Find first valid value ptr (FOV)
+        uint fovPtr = 0;
+        var block = ReadBytes(FollowNode, 0x2100);
+        if (block == null) { lines.Add("Failed to read FollowNode"); return lines; }
+        for (int i = 0; i < 0x2000 / 0x50; i++)
+        {
+            uint no = 0x050 + (uint)i * 0x50;
+            int off = (int)(no + PARAM_VALPTR_OFF);
+            if (off + 4 > block.Length) break;
+            uint ptr = (uint)(block[off] << 24 | block[off + 1] << 16 | block[off + 2] << 8 | block[off + 3]);
+            if (ptr >= HEAP_LO && ptr < HEAP_HI) { fovPtr = ptr; break; }
+        }
+        if (fovPtr == 0) { lines.Add("No valid value ptr found"); return lines; }
+
+        uint baseAddr = fovPtr & ~0xFFFu;
+        const int size = 0x4000;
+        lines.Add($"FOV ptr = 0x{fovPtr:X8}, dumping {size} bytes from 0x{baseAddr:X8}\n");
+
+        var data = ReadBytes(baseAddr, size);
+        if (data == null) { lines.Add("Failed to read memory"); return lines; }
+
+        for (int off = 0; off + 4 <= data.Length; off += 4)
+        {
+            uint u = (uint)(data[off] << 24 | data[off + 1] << 16 | data[off + 2] << 8 | data[off + 3]);
+            float f = BitConverter.IsLittleEndian
+                ? BitConverter.ToSingle(new byte[] { data[off + 3], data[off + 2], data[off + 1], data[off] })
+                : BitConverter.ToSingle(data, off);
+
+            if (float.IsNaN(f) || float.IsInfinity(f)) continue;
+            // Only show reasonable float values
+            if (f < -1000f || f > 10000f) continue;
+
+            string marker = (baseAddr + (uint)off) == fovPtr ? " ← FOV" : "";
+            lines.Add($"  +0x{off:X4}  0x{u:X8}  {f,12:G6}{marker}");
+        }
+
+        lines.Add($"\nTotal floats in {size} bytes at 0x{baseAddr:X8}");
+        return lines;
+    }
+
+    void DoPtrChainScan(List<string> lines)
+    {
+        const uint LO = 0x38000000, HI = 0x40000000;
+        const int CHUNK = 0x80000;
+        byte n0=0x01, n1=0x6C, n2=0x54, n3=0x20;
+
+        for (uint va = LO; va < HI; va += CHUNK)
+        {
+            var d = ReadBytes(va, (int)Math.Min(CHUNK, HI - va));
+            if (d == null) continue;
+            for (int idx = 0; idx <= d.Length - 4; idx += 4)
+            {
+                if (d[idx]!=n0||d[idx+1]!=n1||d[idx+2]!=n2||d[idx+3]!=n3) continue;
+                if (idx < 0x10) continue;
+                uint chrcam = (uint)(va + idx - 0x10);
+                var vt = ReadU32(chrcam);
+                if (!vt.HasValue || !IsBssPtr(vt.Value)) continue;
+                var follow = ReadU32(chrcam + 0x1C);
+                if (!follow.HasValue || !IsHeapPtr(follow.Value)) continue;
+
+                lines.Add($"  ChrCam @ 0x{chrcam:X8} vt=0x{vt.Value:X8}");
+                lines.Add($"  FollowNode @ 0x{follow.Value:X8}");
+
+                // Dump FollowNode first 0x100 bytes
+                var nd = ReadBytes(follow.Value, 0x100);
+                if (nd != null)
+                {
+                    var sb = new System.Text.StringBuilder("  FollowNode[0..FF]: ");
+                    for (int i = 0; i < nd.Length; i += 4)
+                        sb.Append($"{nd[i]:X2}{nd[i+1]:X2}{nd[i+2]:X2}{nd[i+3]:X2} ");
+                    lines.Add(sb.ToString());
+                }
+                return; // just first hit
+            }
+        }
+        lines.Add("  No FollowNode found via ptr-chain scan");
+    }
+
+    /// <summary>
+    /// Clears the FollowNode and DirectMode without closing the handle.
+    /// Used when the user switches between Normal/Debug EBOOT modes
+    /// so stale addresses from the other mode don't leak into the UI.
+    /// </summary>
+    public void ResetFollowNode()
+    {
+        FollowNode  = 0;
+        DirectMode  = false;
     }
 
     public void Dispose() => Close();

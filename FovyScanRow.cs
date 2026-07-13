@@ -8,7 +8,7 @@ public class FovyScanRow : INotifyPropertyChanged
 {
     public uint   Addr    { get; init; }
     public string AddrHex  => $"0x{Addr:X8}";
-    public string AddrCE   => $"{0x300000000L + Addr:X9}";  // RPCS3 host address for CE
+    public string AddrCE   => $"{Ps3Memory.PS3_BASE + Addr:X9}";  // RPCS3 host address for CE
 
     string _liveDeg  = "—";
     string _setValue = "";

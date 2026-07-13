@@ -13,9 +13,9 @@ public class MainViewModel : INotifyPropertyChanged
     readonly Dispatcher _ui;
     DispatcherTimer?    _refreshTimer;
     DispatcherTimer?    _lockTimer;
-    bool                _searching;
-    StreamWriter?       _logWriter;
-    bool                _debugEboot;   // set by FindNodeAsync, used by auto-refresh
+    volatile bool       _searching;
+    DateTime            _lastSearchTime = DateTime.MinValue;
+    bool                _debugEboot;   // mirrors DebugEbootCheck; set by SetDebugEboot()
     int                 _lockIntervalMs    = 250;
     int                 _refreshIntervalMs = 500;
 
@@ -29,12 +29,42 @@ public class MainViewModel : INotifyPropertyChanged
     bool   _autoRefresh;
     bool   _isConnected;
     bool   _nodeFound;
+    bool   _fovRangeCheckEnabled = true;
 
     public string ConnStatus   { get => _connStatus;   private set { _connStatus   = value; OnPC(); } }
     public string StatusText   { get => _statusText;   private set { _statusText   = value; OnPC(); } }
     public string NodeText     { get => _nodeText;     private set { _nodeText     = value; OnPC(); } }
     public bool   IsConnected  { get => _isConnected;  private set { _isConnected  = value; OnPC(); } }
     public bool   NodeFound    { get => _nodeFound;    private set { _nodeFound    = value; OnPC(); } }
+
+    /// <summary>
+    /// Mirrors the Debug EBOOT checkbox.  When true, FindFollowNode uses the
+    /// debug_menu ptr-chain first; when false it uses the vtable scan.
+    /// Stored here so AutoRefresh re-searches in the same mode as the last
+    /// manual Find — regardless of when AutoRefresh was toggled.
+    /// </summary>
+    public bool DebugEboot
+    {
+        get => _debugEboot;
+        set
+        {
+            if (_debugEboot == value) return;
+            _debugEboot = value;
+            OnPC();
+
+            // Mode switch invalidates the old node — it was found in the other mode
+            // and its layout does not match the newly selected param table.
+            if (_mem.IsOpen)
+                _mem.ResetFollowNode();
+            StopLockTimer();
+            NodeFound = false;
+            NodeText  = "ChrFollowCam node: —";
+
+            // Rebuild param list for the NEW mode without resolving addresses.
+            // The user must press Find to re-discover the node.
+            RebuildParams(false);
+        }
+    }
 
     public bool AutoRefresh
     {
@@ -43,6 +73,18 @@ public class MainViewModel : INotifyPropertyChanged
         {
             _autoRefresh = value; OnPC();
             if (value) StartTimer(); else StopTimer();
+        }
+    }
+
+    public bool FovRangeCheckEnabled
+    {
+        get => _fovRangeCheckEnabled;
+        set
+        {
+            _fovRangeCheckEnabled = value;
+            Ps3Memory.FovRangeCheckEnabled = value;
+            OnPC();
+            SaveSettings();
         }
     }
 
@@ -83,43 +125,55 @@ public class MainViewModel : INotifyPropertyChanged
     public MainViewModel(Dispatcher ui)
     {
         _ui = ui;
-        foreach (var def in ParamDef.All)
+        LoadSettings();  // loads _debugEboot, _fovRangeCheckEnabled before building params
+        Ps3Memory.FovRangeCheckEnabled = _fovRangeCheckEnabled;
+        foreach (var def in ActiveDefs())
             Params.Add(new ParamRow(def));
-        // Open log file once, keep it open — faster than AppendAllText per line
-        try
-        {
-            string logPath = System.IO.Path.Combine(AppContext.BaseDirectory, "hooker_log.txt");
-            _logWriter = new StreamWriter(logPath, append: true, System.Text.Encoding.UTF8)
-                         { AutoFlush = true };
-        }
-        catch { }
-
-        LoadSettings();
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
-    void AddLog(string msg)
+    bool _logMuted = true;
+    public bool LogMuted { get => _logMuted; set { _logMuted = value; OnPC(); } }
+    void AddLog(string msg, bool uiOnly = false)
     {
+        if (_logMuted) return;
         string line = $"[{DateTime.Now:HH:mm:ss}] {msg}";
-        try { _logWriter?.WriteLine(line); } catch { }
         _ui.BeginInvoke(() =>
         {
             Log.Add(line);
-            if (Log.Count > 1000) Log.RemoveAt(0);
-        });
+            if (Log.Count > 300) Log.RemoveAt(0);
+        }, System.Windows.Threading.DispatcherPriority.Background);
     }
 
     // ── Connect ───────────────────────────────────────────────────────────────
     public async Task ConnectAsync()
     {
-        AddLog("Connecting…");
+        // Phase 1: find RPCS3 process
+        AddLog("Phase 1: looking for rpcs3.exe…");
         int pid = await Task.Run(() => Ps3Memory.FindPid("rpcs3.exe"));
-        if (pid == 0) { AddLog("rpcs3.exe not found"); return; }
+        if (pid == 0) { AddLog("rpcs3.exe not found — is the emulator running?"); return; }
+        AddLog($"rpcs3.exe found (PID={pid})");
+        ConnStatus = "● RPCS3 found";
+        StatusText = $"PID={pid}, waiting for game…";
 
-        bool ok = await Task.Run(() => _mem.Open(pid));
-        if (!ok) { AddLog($"OpenProcess failed PID={pid}"); return; }
+        // Phase 2: wait for game window (poll every 500ms, up to 60s)
+        AddLog("Phase 2: waiting for Demon's Souls window…");
+        bool ready = false;
+        for (int i = 0; i < 120; i++) // 120 × 500ms = 60s timeout
+        {
+            if (await Task.Run(() => Ps3Memory.IsGameWindowOpen())) { ready = true; break; }
+            await Task.Delay(500);
+        }
+        if (!ready) { AddLog("Timed out waiting for game window — try again later"); return; }
+        AddLog("Game window detected");
 
-        AddLog($"Attached PID={pid}  verified={_mem.Verified}");
+        // Phase 3: ensure handle is open
+        if (!_mem.IsOpen)
+        {
+            bool ok = await Task.Run(() => _mem.Open(pid));
+            if (!ok) { AddLog($"OpenProcess failed PID={pid}"); return; }
+        }
+        AddLog($"Connected  verified={_mem.Verified}");
         IsConnected = true;
         ConnStatus  = "● Connected";
         StatusText  = $"PS3 base 0x{Ps3Memory.PS3_BASE:X}  verified={_mem.Verified}";
@@ -143,18 +197,22 @@ public class MainViewModel : INotifyPropertyChanged
     }
 
     // ── Params rebuild ────────────────────────────────────────────────────────
+    // Returns the correct param table for the current mode.
+    ParamDef[] ActiveDefs() => _debugEboot ? DebugParamDef.All : ParamDef.All;
+
     void RebuildParams(bool directMode)
     {
+        var defs = ActiveDefs();
         _ui.Invoke(() =>
         {
             Params.Clear();
-            foreach (var def in ParamDef.All)
+            foreach (var def in defs)
             {
-                // Normal EBOOT: only show params with a known DirectOffset
+                // Normal EBOOT: skip params without a known DirectOffset
                 if (directMode && def.DirectOffset == 0) continue;
                 var row = new ParamRow(def);
-                if (directMode && def.DirectOffset != 0 && _mem.FollowNode != 0)
-                    row.Ps3Addr = _mem.FollowNode + def.DirectOffset;
+                if (directMode && _mem.FollowNode != 0)
+                    row.Ps3Addr = _mem.FollowNode + def.DirectOffset + (uint)def.FieldOffset;
                 Params.Add(row);
             }
         });
@@ -162,13 +220,12 @@ public class MainViewModel : INotifyPropertyChanged
         // Debug EBOOT: resolve ptr-chain addresses in background
         if (!directMode && _mem.FollowNode != 0)
         {
-            // Snapshot the rows list on the UI thread — Params (ObservableCollection)
-            // must not be enumerated from a background thread.
             var rowSnapshot = Params.ToList();
             Task.Run(() =>
             {
                 foreach (var row in rowSnapshot)
                 {
+                    if (row.Def.NodeOffset == 0) continue;
                     var ptr = _mem.GetParamPtr(row.Def.NodeOffset);
                     if (ptr.HasValue)
                         _ui.BeginInvoke(() => row.Ps3Addr = (uint)(ptr.Value + row.Def.FieldOffset));
@@ -219,7 +276,7 @@ public class MainViewModel : INotifyPropertyChanged
                     if (eq < 0) continue;
                     var name  = trimmed[..eq].Trim();
                     var value = trimmed[(eq + 1)..].Trim();
-                    var row   = Params.FirstOrDefault(p => p.Name == name);
+                    var row   = Params.FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
                     if (row == null) { skipped++; continue; }
                     row.Input    = value;
                     row.IsLocked = true;
@@ -248,7 +305,7 @@ public class MainViewModel : INotifyPropertyChanged
             {
                 var eq = lines[i].IndexOf('=');
                 if (eq < 0) continue;
-                if (lines[i][..eq].Trim() == name)
+                if (string.Equals(lines[i][..eq].Trim(), name, StringComparison.OrdinalIgnoreCase))
                 {
                     lines[i] = $"{name} = {value}";
                     found = true;
@@ -263,19 +320,32 @@ public class MainViewModel : INotifyPropertyChanged
     }
 
     // ── Find node ─────────────────────────────────────────────────────────────
-    public async Task FindNodeAsync(bool debugEboot = false)
+    void FireFindNodeAsync()
+    {
+        _ = FindNodeAsync().ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                AddLog($"FindNodeAsync error: {t.Exception?.InnerException?.Message}");
+        }, TaskContinuationOptions.OnlyOnFaulted);
+    }
+    public async Task FindNodeAsync(bool? debugEboot = null)
     {
         if (!IsConnected || _searching) return;
-        _debugEboot = debugEboot;
+        // Throttle: at least 1s between automatic re-searches
+        if ((DateTime.UtcNow - _lastSearchTime).TotalMilliseconds < 1000) return;
+        // If caller specifies mode — update the stored flag; otherwise reuse it.
+        if (debugEboot.HasValue)
+            DebugEboot = debugEboot.Value;
+        bool mode = _debugEboot;
         _searching = true;
         try
         {
             if (!NodeFound)
                 NodeText = "ChrFollowCam node: searching…";
-            AddLog($"Searching heap… (mode: {(debugEboot ? "Debug EBOOT" : "Normal EBOOT")})");
+            AddLog($"Searching heap… (mode: {(mode ? "Debug EBOOT" : "Normal EBOOT")})");
 
             var progress = new Progress<string>(msg => AddLog($"  {msg}"));
-            uint? node = await Task.Run(() => _mem.FindFollowNode(progress, debugEboot));
+            uint? node = await Task.Run(() => _mem.FindFollowNode(progress, mode));
 
             if (node.HasValue)
             {
@@ -318,7 +388,6 @@ public class MainViewModel : INotifyPropertyChanged
                     .ToList();
                 if (locked.Count > 0)
                 {
-                    // Ensure lock timer is running regardless of how we got here
                     if (_lockTimer == null) StartLockTimer();
                     AddLog($"Re-applying {locked.Count} locked value(s)…");
                     await Task.Run(() =>
@@ -336,50 +405,79 @@ public class MainViewModel : INotifyPropertyChanged
             else
             {
                 NodeText  = "ChrFollowCam node: NOT FOUND — will retry";
-                AddLog("Node not found — will retry on next refresh");
+                AddLog("Node not found — will retry on next refresh", uiOnly: true);
                 NodeFound = false;
-                StopLockTimer(); // no point ticking while node is absent
+                StopLockTimer();
             }
         }
-        finally { _searching = false; }
+        finally { _searching = false; _lastSearchTime = DateTime.UtcNow; }
     }
 
     // ── Refresh ───────────────────────────────────────────────────────────────
     public async Task RefreshAsync()
     {
         if (!IsConnected) return;
+        // Check game window is still open (only matters when auto-refresh is on)
+        if (_autoRefresh && !await Task.Run(() => Ps3Memory.IsGameWindowOpen()))
+        {
+            AddLog("Game window lost — stopping auto-refresh and clearing locks");
+            AutoRefresh = false;
+            StopLockTimer();
+            foreach (var r in Params) r.IsLocked = false;
+            return;
+        }
         if (!NodeFound)
         {
-            if (!_searching) _ = FindNodeAsync(_debugEboot);
+            // Only search if the game window is actually open
+            if (await Task.Run(() => Ps3Memory.IsGameWindowOpen()))
+                if (!_searching) FireFindNodeAsync();
             return;
         }
 
         // Bulk read: node block + all param pages in one shot
-        var (valid, vals) = await Task.Run(() =>
+        var (valid, vals, fovyOutOfRange) = await Task.Run(() =>
         {
             if (_mem.FollowNode == 0 || !_mem.IsOpen)
-                return (false, (Dictionary<string,double?>?)null);
+                return (false, (Dictionary<string,double?>?)null, false);
 
             // 1. Validate that FollowNode still points to a ChrFollowCam object
             //    by checking that its vtable pointer falls in the BSS/static range.
             //    After a level transition the old heap object is freed and the vtable
             //    will no longer be valid — this is the reliable signal to re-search.
-            //    We do NOT validate FovY here because its range can legitimately vary.
             var vt = _mem.ReadU32(_mem.FollowNode);
             if (!vt.HasValue || vt.Value < Ps3Memory.PS3_BSS_LO || vt.Value >= Ps3Memory.PS3_BSS_HI)
-                return (false, (Dictionary<string,double?>?)null);
+                return (false, (Dictionary<string,double?>?)null, false);
 
-            // 2. Bulk read all params
-            var d = _mem.ReadParamsBulk(ParamDef.All);
-            return (true, d);
+            // 2. Bulk read all params using the active table
+            var d = _mem.ReadParamsBulk(ActiveDefs());
+
+            // 3. If range check is enabled, validate FovY to detect stale nodes
+            bool badFovy = false;
+            if (Ps3Memory.FovRangeCheckEnabled && d.TryGetValue("FovY", out var fv) && fv.HasValue)
+            {
+                float rad = (float)(fv.Value * Ps3Memory.DEG2RAD);
+                if (rad < Ps3Memory.FOVY_MIN || rad > Ps3Memory.FOVY_MAX)
+                    badFovy = true;
+            }
+            return (true, d, badFovy);
         });
 
-        if (!valid)
+        if (!valid || fovyOutOfRange)
         {
-            AddLog("Node invalidated — re-searching…");
+            if (fovyOutOfRange)
+                AddLog("FovY out of range — re-searching…");
+            else
+                AddLog("Node invalidated — re-searching…");
+            // Check if the RPCS3 process is still alive before re-searching.
+            if (!await Task.Run(() => _mem.IsProcessAlive()))
+            {
+                AddLog("rpcs3.exe process lost — disconnecting");
+                Disconnect();
+                return;
+            }
             NodeFound = false;
             NodeText  = "ChrFollowCam node: re-searching…";
-            if (!_searching) _ = FindNodeAsync(_debugEboot);
+            if (!_searching) FireFindNodeAsync();
             return;
         }
 
@@ -421,14 +519,17 @@ public class MainViewModel : INotifyPropertyChanged
         if (!IsConnected || !NodeFound) return;
         AddLog("Resetting all…");
         var defs = Params.Select(p => p.Def).ToList();
-        await Task.Run(() =>
+        var results = await Task.Run(() =>
         {
+            var lines = new List<string>();
             foreach (var def in defs)
             {
                 bool ok = _mem.WriteParam(def.NodeOffset, def.Unit, def.Default, def.FieldOffset, def.DirectOffset);
-                AddLog($"{(ok?"OK":"FAIL")}  {def.Name} = {def.Default:G6}");
+                lines.Add($"{(ok?"OK":"FAIL")}  {def.Name} = {def.Default:G6}");
             }
+            return lines;
         });
+        foreach (var l in results) AddLog(l);
         await RefreshAsync();
         AddLog("Reset done.");
     }
@@ -474,12 +575,16 @@ public class MainViewModel : INotifyPropertyChanged
     async Task BsWriteRange(int lo, int hi, string label)
     {
         double deg = NextFov();
-        float rad = (float)(deg / 57.296);
+        float rad = (float)(deg * Ps3Memory.DEG2RAD);
         var targets = FovyScanResults.Skip(lo).Take(hi - lo).ToList();
-        int ok = 0;
-        await Task.Run(() => { foreach (var r in targets) if (_mem.WriteF32(r.Addr, rad)) ok++; });
-        _ui.Invoke(() => { foreach (var r in targets) r.LiveDeg = $"{deg:F0}°"; });
-        AddLog($"BS {label}: wrote {deg:F0}° to rows {lo}..{hi} ({ok} ok)");
+        var succeeded = await Task.Run(() =>
+        {
+            var ok = new List<FovyScanRow>();
+            foreach (var r in targets) if (_mem.WriteF32(r.Addr, rad)) ok.Add(r);
+            return ok;
+        });
+        _ui.Invoke(() => { foreach (var r in succeeded) r.LiveDeg = $"{deg:F0}°"; });
+        AddLog($"BS {label}: wrote {deg:F0}° to rows {lo}..{hi} ({succeeded.Count}/{targets.Count} ok)");
     }
 
     public async Task BsLeft()
@@ -582,7 +687,7 @@ public class MainViewModel : INotifyPropertyChanged
                 FovyScanResults.Add(new FovyScanRow
                 {
                     Addr    = addr,
-                    LiveDeg = $"{val * 57.296f:F1}°",
+                    LiveDeg = $"{val * Ps3Memory.RAD2DEG:F1}°",
                     Context = ctx
                 });
         });
@@ -620,7 +725,7 @@ public class MainViewModel : INotifyPropertyChanged
             {
                 var row = FovyScanResults.FirstOrDefault(r => r.Addr == addr);
                 if (row != null)
-                    row.LiveDeg = val.HasValue ? $"{val.Value * 57.296f:F1}°" : "err";
+                    row.LiveDeg = val.HasValue ? $"{val.Value * Ps3Memory.RAD2DEG:F1}°" : "err";
             }
         });
 
@@ -643,7 +748,7 @@ public class MainViewModel : INotifyPropertyChanged
                     if (double.TryParse(setValue,
                         System.Globalization.NumberStyles.Float,
                         System.Globalization.CultureInfo.InvariantCulture, out double deg))
-                        try { _mem.WriteF32(addr, (float)(deg / 57.296)); }
+                        try { _mem.WriteF32(addr, (float)(deg * Ps3Memory.DEG2RAD)); }
                         catch { /* ignore write errors — stale address after teleport */ }
             });
         }
@@ -652,52 +757,50 @@ public class MainViewModel : INotifyPropertyChanged
     public async Task WriteFovYRangeAsync(double deg, int fromRow, int toRow)
     {
         if (!IsConnected || FovyScanResults.Count == 0) { AddLog("No results"); return; }
-        float rad = (float)(deg / 57.296);
+        float rad = (float)(deg * Ps3Memory.DEG2RAD);
         var targets = FovyScanResults.Skip(fromRow).Take(toRow - fromRow).ToList();
         if (targets.Count == 0) { AddLog($"No rows in range {fromRow}..{toRow}"); return; }
         string setStr = $"{deg:F1}";
-        int ok = 0, fail = 0;
-        await Task.Run(() =>
+        var succeeded = await Task.Run(() =>
         {
+            var ok = new List<FovyScanRow>();
             foreach (var row in targets)
-                if (_mem.WriteF32(row.Addr, rad)) ok++;
-                else fail++;
+                if (_mem.WriteF32(row.Addr, rad)) ok.Add(row);
+            return ok;
         });
-        // Update UI properties on the UI thread
         _ui.Invoke(() =>
         {
-            foreach (var row in targets)
+            foreach (var row in succeeded)
             {
                 row.SetValue = setStr;
                 row.LiveDeg  = $"{deg:F1}°";
             }
         });
-        AddLog($"Write {deg:F1}° to rows {fromRow}..{toRow} ({targets.Count} rows): OK={ok} FAIL={fail}");
+        AddLog($"Write {deg:F1}° to rows {fromRow}..{toRow} ({succeeded.Count}/{targets.Count} ok)");
     }
 
     public async Task WriteFovYAllAsync(double deg, int count = int.MaxValue)
     {
         if (!IsConnected || FovyScanResults.Count == 0) { AddLog("No results to write"); return; }
-        float rad = (float)(deg / 57.296);
+        float rad = (float)(deg * Ps3Memory.DEG2RAD);
         var targets = FovyScanResults.Take(count).ToList();
         string setStr = $"{deg:F1}";
-        int ok = 0, fail = 0;
-        await Task.Run(() =>
+        var succeeded = await Task.Run(() =>
         {
+            var ok = new List<FovyScanRow>();
             foreach (var row in targets)
-                if (_mem.WriteF32(row.Addr, rad)) ok++;
-                else fail++;
+                if (_mem.WriteF32(row.Addr, rad)) ok.Add(row);
+            return ok;
         });
-        // Update UI properties on the UI thread
         _ui.Invoke(() =>
         {
-            foreach (var row in targets)
+            foreach (var row in succeeded)
             {
                 row.SetValue = setStr;
                 row.LiveDeg  = $"{deg:F1}°";
             }
         });
-        AddLog($"Write {deg:F0}° to first {count} ({targets.Count} rows): OK={ok} FAIL={fail}");
+        AddLog($"Write {deg:F0}° to first {count} ({succeeded.Count}/{targets.Count} ok)");
     }
 
     public async Task WriteFovYRowAsync(FovyScanRow row)
@@ -709,7 +812,7 @@ public class MainViewModel : INotifyPropertyChanged
         {
             AddLog($"Invalid value: '{row.SetValue}'"); return;
         }
-        float rad = (float)(deg / 57.296);
+        float rad = (float)(deg * Ps3Memory.DEG2RAD);
         bool ok = await Task.Run(() => _mem.WriteF32(row.Addr, rad));
         AddLog($"{(ok?"OK":"FAIL")} FovY @ 0x{row.Addr:X8} = {deg:F1}°");
         if (ok) row.LiveDeg = $"{deg:F1}°";
@@ -747,6 +850,127 @@ public class MainViewModel : INotifyPropertyChanged
         }
         catch (Exception ex) { AddLog($"  EXCEPTION: {ex.Message}"); }
         AddLog("=== END ===");
+    }
+
+    /// <summary>
+    /// Bulk-reads all params for the active mode and dumps every param with its
+    /// current value (or ERR for failed reads) plus offset info.  Helps the user
+    /// quickly identify which offsets are wrong in the current EBOOT.
+    /// </summary>
+    public async Task DumpErroredParamsAsync()
+    {
+        if (!IsConnected) { AddLog("Not connected"); return; }
+        if (!NodeFound)
+        {
+            AddLog("Node not found — find it first.");
+            return;
+        }
+        AddLog("=== PARAM DUMP START ===");
+        try
+        {
+            var vals = await Task.Run(() => _mem.ReadParamsBulk(ActiveDefs()));
+            if (vals == null) { AddLog("  ReadParamsBulk returned null"); return; }
+
+            int total   = 0;
+            int errored = 0;
+            foreach (var kv in vals)
+            {
+                total++;
+                var def = ActiveDefs().FirstOrDefault(d => d.Name == kv.Key);
+                string modeInfo = "";
+                if (def != null)
+                    modeInfo = _mem.DirectMode
+                        ? $"DO=0x{def.DirectOffset:X3}+{def.FieldOffset}"
+                        : $"NO=0x{def.NodeOffset:X3}+{def.FieldOffset}";
+
+                if (kv.Value.HasValue)
+                {
+                    string val = kv.Value.Value switch
+                    {
+                        < 1.0 => $"{kv.Value.Value:G6}",
+                        < 100.0 => $"{kv.Value.Value:F4}",
+                        _ => $"{kv.Value.Value:G6}"
+                    };
+                    AddLog($"  OK  {kv.Key,-36}  {modeInfo,-18}  {val,10}");
+                }
+                else
+                {
+                    errored++;
+                    AddLog($"  ERR {kv.Key,-36}  {modeInfo,-18}  {"<null>",10}");
+                }
+            }
+
+            AddLog($"  OK: {total - errored}/{total}  ERR: {errored}/{total}");
+        }
+        catch (Exception ex) { AddLog($"  EXCEPTION: {ex.Message}"); }
+        AddLog("=== PARAM DUMP END ===");
+    }
+
+    /// <summary>
+    /// Exhaustive BFS of the debug_menu tree from root, trying ALL 4-byte
+    /// offsets as child pointers.  Logs every reachable node so the user
+    /// can identify the correct tree offsets for their EBOOT version.
+    /// </summary>
+    public async Task DeepTreeAnalysisAsync()
+    {
+        if (!IsConnected) { AddLog("Not connected"); return; }
+        AddLog("=== DEEP TREE ANALYSIS START ===");
+        try
+        {
+            var lines = await Task.Run(() => _mem.DeepTreeAnalysis());
+            foreach (var l in lines) AddLog(l);
+        }
+        catch (Exception ex) { AddLog($"  EXCEPTION: {ex.Message}"); }
+        AddLog("=== DEEP TREE ANALYSIS END ===");
+    }
+
+    /// <summary>
+    /// Reads every possible NO (0x050–0x2000, step 0x50) from the ptr-chain
+    /// and logs which slots have valid value pointers and their current values.
+    /// This discovers the exact parameter map of the debug_menu tree.
+    /// </summary>
+    public async Task ScanSlotsAsync()
+    {
+        if (!IsConnected) { AddLog("Not connected"); return; }
+        AddLog("=== SLOT SCAN START ===");
+        try
+        {
+            var lines = await Task.Run(() => _mem.ScanSlots());
+            foreach (var l in lines) AddLog(l);
+        }
+        catch (Exception ex) { AddLog($"  EXCEPTION: {ex.Message}"); }
+        AddLog("=== SLOT SCAN END ===");
+    }
+
+    /// <summary>
+    /// Dumps a large memory region around the FOV value ptr to find the struct layout.
+    /// </summary>
+    public async Task ScanAllOffsetsAsync()
+    {
+        AddLog("=== SCAN ALL OFFSETS ===");
+        try
+        {
+            var lines = await Task.Run(() => _mem.ScanAllOffsets());
+            foreach (var l in lines) AddLog(l);
+            AddLog("=== END SCAN ALL OFFSETS ===");
+        }
+        catch (Exception ex)
+        {
+            AddLog($"ERROR: {ex.Message}");
+        }
+    }
+
+    public async Task DumpParamMemoryAsync()
+    {
+        if (!IsConnected) { AddLog("Not connected"); return; }
+        AddLog("=== PARAM MEMORY DUMP START ===");
+        try
+        {
+            var lines = await Task.Run(() => _mem.DumpParamMemory());
+            foreach (var l in lines) AddLog(l);
+        }
+        catch (Exception ex) { AddLog($"  EXCEPTION: {ex.Message}"); }
+        AddLog("=== PARAM MEMORY DUMP END ===");
     }
 
     // ── Auto-refresh timer ────────────────────────────────────────────────────
@@ -833,12 +1057,13 @@ public class MainViewModel : INotifyPropertyChanged
                 {
                     case "LockIntervalMs"    when int.TryParse(val, out int l) && l >= 1: _lockIntervalMs    = l; break;
                     case "RefreshIntervalMs" when int.TryParse(val, out int r) && r >= 1: _refreshIntervalMs = r; break;
+                    case "FovRangeCheckEnabled" when bool.TryParse(val, out bool f): _fovRangeCheckEnabled = f; break;
                 }
             }
             OnPC(nameof(LockIntervalMs));
             OnPC(nameof(RefreshIntervalMs));
         }
-        catch { }
+        catch (Exception ex) { AddLog($"LoadSettings error: {ex.Message}"); }
     }
 
     void SaveSettings()
@@ -850,9 +1075,10 @@ public class MainViewModel : INotifyPropertyChanged
                 "# DeSCam settings — auto-generated, do not edit manually",
                 $"LockIntervalMs    = {_lockIntervalMs}",
                 $"RefreshIntervalMs = {_refreshIntervalMs}",
+                $"FovRangeCheckEnabled = {_fovRangeCheckEnabled}",
             ], System.Text.Encoding.UTF8);
         }
-        catch { }
+        catch (Exception ex) { AddLog($"SaveSettings error: {ex.Message}"); }
     }
 
     async Task WriteLocked()
@@ -869,12 +1095,19 @@ public class MainViewModel : INotifyPropertyChanged
         bool nodeStillValid = await Task.Run(() => _mem.IsFollowNodeValid());
         if (!nodeStillValid)
         {
+            // Check if RPCS3 is still alive before re-searching.
+            if (!await Task.Run(() => _mem.IsProcessAlive()))
+            {
+                AddLog("Lock: rpcs3.exe process lost — disconnecting");
+                Disconnect();
+                return;
+            }
             // Node was invalidated (teleport / level transition) — don't write stale
             // memory. Mark node as lost so RefreshAsync will trigger a re-search.
             AddLog("WriteLocked: node invalidated — aborting write, re-searching…");
             NodeFound = false;
             NodeText  = "ChrFollowCam node: re-searching…";
-            if (!_searching) _ = FindNodeAsync(_debugEboot);
+            if (!_searching) FireFindNodeAsync();
             return;
         }
 
@@ -906,6 +1139,5 @@ public class MainViewModel : INotifyPropertyChanged
         StopLockTimer();
         StopFovyScanTimer();
         _mem.Dispose();
-        _logWriter?.Dispose();
     }
 }

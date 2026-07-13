@@ -1,4 +1,5 @@
-﻿using System.Windows;
+﻿using System;
+using System.Windows;
 using System.Windows.Controls;
 
 namespace DeSCam;
@@ -47,7 +48,7 @@ public partial class MainWindow : Window
 
     // ── ChrFollowCam tab ──────────────────────────────────────────────────────
     async void Find_Click(object s, RoutedEventArgs e)
-        => await _vm.FindNodeAsync(DebugEbootCheck.IsChecked == true);
+        => await _vm.FindNodeAsync();
 
     async void Refresh_Click(object s, RoutedEventArgs e)
         => await _vm.RefreshAsync();
@@ -62,6 +63,21 @@ public partial class MainWindow : Window
 
     void DebugTree_Click(object s, RoutedEventArgs e)
         => _ = _vm.DumpFollowNodeAsync();
+
+    async void ErrDump_Click(object s, RoutedEventArgs e)
+        => await _vm.DumpErroredParamsAsync();
+
+    async void DeepTree_Click(object s, RoutedEventArgs e)
+        => await _vm.DeepTreeAnalysisAsync();
+
+    async void SlotScan_Click(object s, RoutedEventArgs e)
+        => await _vm.ScanSlotsAsync();
+
+    async void ScanAll_Click(object s, RoutedEventArgs e)
+        => await _vm.ScanAllOffsetsAsync();
+
+    async void MemDump_Click(object s, RoutedEventArgs e)
+        => await _vm.DumpParamMemoryAsync();
 
     async void WriteParam_Click(object s, RoutedEventArgs e)
     {
@@ -103,6 +119,19 @@ public partial class MainWindow : Window
     }
 
     // ── Log tab ───────────────────────────────────────────────────────────────
+    bool _logAutoScroll = true;
+    void LogList_ScrollChanged(object s, ScrollChangedEventArgs e)
+    {
+        if (e.Source is not ScrollViewer sv) return;
+        // If user scrolled away from bottom, stop auto-scrolling
+        if (Math.Abs(sv.VerticalOffset - sv.ScrollableHeight) < 2)
+            _logAutoScroll = true;
+        else if (e.ExtentHeightChange == 0) // only track manual scrolls
+            _logAutoScroll = false;
+        // Auto-scroll to bottom when new line added and user hasn't scrolled up
+        if (_logAutoScroll && e.ExtentHeightChange > 0)
+            sv.ScrollToBottom();
+    }
     void ClearLog_Click(object s, RoutedEventArgs e)
         => _vm.Log.Clear();
 

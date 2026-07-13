@@ -33,12 +33,9 @@ public partial class App : Application
 
     static void LogUnhandled(string source, Exception ex)
     {
-        try
-        {
-            string path = System.IO.Path.Combine(AppContext.BaseDirectory, "crash_log.txt");
-            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {source}: {ex}\n";
-            System.IO.File.AppendAllText(path, line, System.Text.Encoding.UTF8);
-        }
-        catch { }
+        // File logging disabled — was writing full stack traces to crash_log.txt
+        // which grew unbounded.  The UI connects to RPCS3's remote process and
+        // uses NtReadVirtualMemory; occasional STATUS_INVALID_HANDLE / access
+        // violations are normal and handled, not crashes.
     }
 }
